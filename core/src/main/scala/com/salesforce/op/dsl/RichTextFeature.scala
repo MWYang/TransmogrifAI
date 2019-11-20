@@ -434,6 +434,15 @@ trait RichTextFeature {
       toLowercase: Boolean = TextTokenizer.ToLowercase
     ): FeatureLike[Binary] =
       f.transformWith(new SubstringTransformer[T, T2]().setToLowercase(toLowercase), f2)
+
+    /**
+     * Check if feature is postal codes, and if so, return postal code with lat/long
+     *
+     * @param threshold optional, fraction of rows containing valid postal codes before processing (default = 0.90)
+     * @return PostalCodeMap, will be empty if no name was found
+     */
+    def identifyIfPostalCode(threshold: Double = 0.90): FeatureLike[PostalCodeMap] =
+      new PostalCodeIdentifier[T]().setThreshold(threshold).setInput(f).getOutput()
   }
 
   implicit class RichPhoneFeature(val f: FeatureLike[Phone]) {
