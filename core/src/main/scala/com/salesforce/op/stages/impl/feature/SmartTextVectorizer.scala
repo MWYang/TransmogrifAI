@@ -32,19 +32,20 @@ package com.salesforce.op.stages.impl.feature
 
 import com.salesforce.op.UID
 import com.salesforce.op.features.TransientFeature
-import com.salesforce.op.features.types.{OPVector, Text, TextList, VectorConversions, SeqDoubleConversions}
+import com.salesforce.op.features.types.{OPVector, SeqDoubleConversions, Text, TextList, VectorConversions}
 import com.salesforce.op.stages.base.sequence.{SequenceEstimator, SequenceModel}
 import com.salesforce.op.stages.impl.feature.VectorizerUtils._
 import com.salesforce.op.utils.json.JsonLike
 import com.salesforce.op.utils.spark.RichDataset._
 import com.salesforce.op.utils.spark.{OpVectorColumnMetadata, OpVectorMetadata}
-import com.twitter.algebird.Monoid
+import com.salesforce.op.utils.stages.SensitiveFeatureMode.Off
+import com.salesforce.op.utils.stages.{NameDetectFun, NameDetectStats}
 import com.twitter.algebird.Monoid._
 import com.twitter.algebird.Operators._
-import com.twitter.algebird.Semigroup
+import com.twitter.algebird.{Monoid, Semigroup, Tuple2Semigroup}
 import org.apache.spark.ml.param._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.{Dataset, Encoder}
+import org.apache.spark.sql.{Dataset, Encoder, Encoders}
 
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
@@ -56,15 +57,21 @@ import scala.reflect.runtime.universe.TypeTag
  * Non-categoricals will be converted into a vector using the hashing trick. In addition, a null indicator is created
  * for each non-categorical (if enabled).
  *
+ * Detection and removal of names in the input columns can be enabled with the `sensitiveFeatureMode` param.
+ *
  * @param uid uid for instance
  */
 class SmartTextVectorizer[T <: Text](uid: String = UID[SmartTextVectorizer[T]])(implicit tti: TypeTag[T])
   extends SequenceEstimator[T, OPVector](operationName = "smartTxtVec", uid = uid)
     with PivotParams with CleanTextFun with SaveOthersParams
     with TrackNullsParam with MinSupportParam with TextTokenizerParams with TrackTextLenParam
-    with HashingVectorizerParams with HashingFun with OneHotFun with MaxCardinalityParams with MinLengthStdDevParams {
-
+    with HashingVectorizerParams with HashingFun with OneHotFun
+    with MaxCardinalityParams with MinLengthStdDevParams
+    with NameDetectFun[T] {
   private implicit val textStatsSeqEnc: Encoder[Array[TextStats]] = ExpressionEncoder[Array[TextStats]]()
+  type StatsTuple = (TextStats, NameDetectStats)
+  type StatsTupleArray = Array[StatsTuple]
+  private implicit val statsTupleSeqEnc: Encoder[StatsTupleArray] = Encoders.kryo[StatsTupleArray]
 
   private def makeHashingParams() = HashingFunctionParams(
     hashWithIndex = $(hashWithIndex),
@@ -84,14 +91,31 @@ class SmartTextVectorizer[T <: Text](uid: String = UID[SmartTextVectorizer[T]])(
     val minLenStdDev = $(minLengthStdDev)
     val shouldCleanText = $(cleanText)
 
-    implicit val testStatsMonoid: Semigroup[TextStats] = TextStats.monoid(maxCard)
-    val valueStats: Dataset[Array[TextStats]] = dataset.map(_.map(computeTextStats(_, shouldCleanText)).toArray)
-    val aggregatedStats: Array[TextStats] = valueStats.reduce(_ + _)
+    implicit val textStatsMonoid: Semigroup[TextStats] = TextStats.monoid(maxCard)
+    implicit val nameDetectStatsMonoid: Semigroup[NameDetectStats] = NameDetectStats.monoid
+    implicit val statsTupleMonoid: Semigroup[StatsTuple] = new Tuple2Semigroup[TextStats, NameDetectStats]()
 
-    val (vectorizationMethods, topValues) = aggregatedStats.map { stats =>
+    val (aggTextStats, aggNameDetectStats) = if (getSensitiveFeatureMode == Off) {
+      (
+        dataset.map(_.map(computeTextStats(_, shouldCleanText)).toArray).reduce(_ + _),
+        Array.fill[NameDetectStats](inN.length)(NameDetectStats.empty)
+      )
+    } else {
+      val nameDetectMapFun = makeMapFunction(dataset.sparkSession)
+      dataset.map(_.map(input =>
+        (
+          computeTextStats(input, shouldCleanText),
+          nameDetectMapFun(input)
+        )
+      ).toArray).reduce(_ + _).unzip
+    }
+
+    val isNameArr: Array[Boolean] = aggNameDetectStats.map(computeTreatAsName)
+    val (vectorizationMethods, topValues) = aggTextStats.zip(isNameArr).map { case (stats, isName) =>
       val vecMethod: TextVectorizationMethod = stats match {
+        case _ if isName && shouldRemoveSensitive => TextVectorizationMethod.Ignore
         case _ if stats.valueCounts.size <= maxCard => TextVectorizationMethod.Pivot
-        case _ if stats.lengthStdDev <= minLenStdDev => TextVectorizationMethod.Ignore
+        case _ if stats.lengthStdDev < minLenStdDev => TextVectorizationMethod.Ignore
         case _ => TextVectorizationMethod.Hash
       }
       val topValues = stats.valueCounts
@@ -109,7 +133,7 @@ class SmartTextVectorizer[T <: Text](uid: String = UID[SmartTextVectorizer[T]])(
       hashingParams = makeHashingParams()
     )
 
-    val vecMetadata = makeVectorMetadata(smartTextParams)
+    val vecMetadata = makeVectorMetadata(smartTextParams, aggNameDetectStats)
     setMetadata(vecMetadata.toMetadata)
 
     new SmartTextVectorizerModel[T](args = smartTextParams, operationName = operationName, uid = uid)
@@ -129,7 +153,10 @@ class SmartTextVectorizer[T <: Text](uid: String = UID[SmartTextVectorizer[T]])(
     TextStats(valueCounts, lengthCounts)
   }
 
-  private def makeVectorMetadata(smartTextParams: SmartTextVectorizerModelArgs): OpVectorMetadata = {
+  private def makeVectorMetadata(
+    smartTextParams: SmartTextVectorizerModelArgs,
+    aggNameDetectStats: Array[NameDetectStats]
+  ): OpVectorMetadata = {
     require(inN.length == smartTextParams.vectorizationMethods.length)
 
     val groups = inN.toArray.zip(smartTextParams.vectorizationMethods).groupBy(_._2)
@@ -147,20 +174,24 @@ class SmartTextVectorizer[T <: Text](uid: String = UID[SmartTextVectorizer[T]])(
       makeVectorColumnMetadata(shouldTrackNulls, unseen, smartTextParams.categoricalTopValues, textToPivot)
     } else Array.empty[OpVectorColumnMetadata]
 
-    val textColumns = if (allTextFeatures.nonEmpty) {
-      if (shouldTrackLen) {
-        makeVectorColumnMetadata(textToHash, makeHashingParams()) ++
-          allTextFeatures.map(_.toColumnMetaData(descriptorValue = OpVectorColumnMetadata.TextLenString)) ++
-          allTextFeatures.map(_.toColumnMetaData(isNull = true))
-      }
-      else {
-        makeVectorColumnMetadata(textToHash, makeHashingParams()) ++
-          allTextFeatures.map(_.toColumnMetaData(isNull = true))
-      }
+    val textColumns = if (textToHash.nonEmpty) {
+      makeVectorColumnMetadata(textToHash, makeHashingParams())
     } else Array.empty[OpVectorColumnMetadata]
 
-    val columns = categoricalColumns ++ textColumns
-    OpVectorMetadata(getOutputFeatureName, columns, Transmogrifier.inputFeaturesToHistory(inN, stageName))
+    val nullAndLenColumns = if (allTextFeatures.nonEmpty) {
+      if (shouldTrackLen) {
+        allTextFeatures.map(_.toColumnMetaData(descriptorValue = OpVectorColumnMetadata.TextLenString)) ++
+        allTextFeatures.map(_.toColumnMetaData(isNull = true))
+      }
+      else {
+        allTextFeatures.map(_.toColumnMetaData(isNull = true))
+      }
+    } else Array.empty[OpVectorColumnMetadata]
+    val columns = categoricalColumns ++ textColumns ++ nullAndLenColumns
+
+    val sensitive = createSensitiveFeatureInformation(aggNameDetectStats, inN.map(_.name))
+
+    OpVectorMetadata(getOutputFeatureName, columns, Transmogrifier.inputFeaturesToHistory(inN, stageName), sensitive)
   }
 }
 
@@ -179,11 +210,7 @@ object SmartTextVectorizer {
  * @param valueCounts  counts of feature values
  * @param lengthCounts counts of token lengths
  */
-private[op] case class TextStats(
-  valueCounts: Map[String, Long],
-  lengthCounts: Map[Int, Long]
-) extends JsonLike {
-
+private[op] case class TextStats(valueCounts: Map[String, Long], lengthCounts: Map[Int, Long]) extends JsonLike {
   val lengthSize = lengthCounts.values.sum
   val lengthMean: Double = lengthCounts.foldLeft(0.0)((acc, el) => acc + el._1 * el._2) / lengthSize
   val lengthVariance: Double = lengthCounts.foldLeft(0.0)(
@@ -225,8 +252,6 @@ private[op] object TextStats {
  * Arguments for [[SmartTextVectorizerModel]]
  *
  * @param vectorizationMethods method to use for text vectorization (either pivot, hashing, or ignoring)
- * @param isCategorical        is feature a categorical or not
- * @param isIgnorable          is a text feature that we think is ignorable? high cardinality + low length variance
  * @param topValues            top values to each feature
  * @param shouldCleanText      should clean text value
  * @param shouldTrackNulls     should track nulls
